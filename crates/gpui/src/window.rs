@@ -2539,7 +2539,11 @@ impl Window {
         self.text_system().finish_frame();
         self.layout_engine.as_mut().unwrap().clear();
 
-        let scene = mem::take(&mut self.next_frame.scene);
+        // Sort the scene into draw order, as a live frame's `finish` does: the renderer takes each
+        // batch from the primitive list whose head is lowest, so a scene left in paint order draws
+        // a primitive painted late but ordered low over the primitives ordered above it.
+        let mut scene = mem::take(&mut self.next_frame.scene);
+        scene.finish();
 
         // Restore live state, then drop the captured element before clearing the arena it
         // was allocated in (the element borrows arena memory). Exiting the scope hands back
@@ -7804,7 +7808,8 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod view_capture_tests {
     use crate::{
-        Context, Hsla, IntoElement, Render, Styled, TestAppContext, Window, div, hsla, px, size,
+        Context, Hsla, IntoElement, ParentElement, PrimitiveBatch, Render, Scene, Styled,
+        TestAppContext, Window, div, hsla, px, size,
     };
 
     /// A view whose only content is a full-viewport solid background quad — so the
@@ -7887,6 +7892,97 @@ mod view_capture_tests {
                 window.next_frame.scene.len(),
                 0,
                 "scratch frame swapped back out of next_frame"
+            );
+        });
+    }
+
+    /// A view that paints a stack of nested backgrounds and, below it, a card whose child casts
+    /// a shadow. The card's background is painted after quads that draw above it, and the
+    /// child's shadow must draw above the card's background.
+    struct LayeredPanel;
+
+    impl Render for LayeredPanel {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let fill = hsla(0.0, 1.0, 0.5, 1.0);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(20.0))
+                .child(
+                    div().size(px(40.0)).bg(fill).child(
+                        div()
+                            .size(px(30.0))
+                            .bg(fill)
+                            .child(div().size(px(20.0)).bg(fill)),
+                    ),
+                )
+                .child(
+                    div()
+                        .size(px(60.0))
+                        .p(px(10.0))
+                        .bg(fill)
+                        .child(div().size(px(20.0)).bg(fill).shadow_md()),
+                )
+        }
+    }
+
+    /// The draw orders of the primitives one batch draws, in the order it draws them.
+    fn batch_orders(scene: &Scene, batch: PrimitiveBatch) -> Vec<u32> {
+        match batch {
+            PrimitiveBatch::Shadows(range) => {
+                scene.shadows[range].iter().map(|p| p.order).collect()
+            }
+            PrimitiveBatch::BackdropBlurs(range) => scene.backdrop_blurs[range]
+                .iter()
+                .map(|p| p.order)
+                .collect(),
+            PrimitiveBatch::Quads(range) => scene.quads[range].iter().map(|p| p.order).collect(),
+            PrimitiveBatch::Paths(range) => scene.paths[range].iter().map(|p| p.order).collect(),
+            PrimitiveBatch::Underlines(range) => {
+                scene.underlines[range].iter().map(|p| p.order).collect()
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => scene.monochrome_sprites[range]
+                .iter()
+                .map(|p| p.order)
+                .collect(),
+            PrimitiveBatch::SubpixelSprites { range, .. } => scene.subpixel_sprites[range]
+                .iter()
+                .map(|p| p.order)
+                .collect(),
+            PrimitiveBatch::PolychromeSprites { range, .. } => scene.polychrome_sprites[range]
+                .iter()
+                .map(|p| p.order)
+                .collect(),
+            PrimitiveBatch::Surfaces(range) => {
+                scene.surfaces[range].iter().map(|p| p.order).collect()
+            }
+            PrimitiveBatch::ShaderPasses(range) => {
+                scene.shader_passes[range].iter().map(|p| p.order).collect()
+            }
+        }
+    }
+
+    /// The renderer takes each next batch from whichever primitive list's head has the lowest
+    /// draw order, so it layers a scene correctly only once every list is sorted by draw order,
+    /// as a live frame's `finish` leaves it. A capture left in paint order draws a primitive
+    /// painted late but ordered low over primitives ordered above it: here the card's background
+    /// covers its child's shadow.
+    #[gpui::test]
+    fn should_draw_a_capture_in_layer_order_when_paint_order_differs(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, _cx| LayeredPanel);
+
+        cx.update(|window, app| {
+            let capture_size = size(px(200.0), px(200.0));
+            let scene = window.capture_view_scene(view.clone().into(), capture_size, app);
+
+            let drawn: Vec<u32> = scene
+                .batches()
+                .flat_map(|batch| batch_orders(&scene, batch))
+                .collect();
+
+            assert!(
+                drawn.is_sorted(),
+                "the capture draws out of layer order: {drawn:?}"
             );
         });
     }
