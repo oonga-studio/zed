@@ -876,6 +876,25 @@ impl MacWindowState {
     }
 }
 
+/// Where `MacWindow::open` puts a window of `bounds` (top-left origin, relative to its display) on
+/// the screen whose frame is `screen_frame` and whose display is `display_height` tall: the content
+/// rect for `initWithContentRect:…screen:`, whose origin is the content's bottom-left corner
+/// relative to that screen, and the frame's top-left point in global coordinates for
+/// `setFrameTopLeftPoint:`.
+fn window_placement(
+    bounds: Bounds<Pixels>,
+    screen_frame: NSRect,
+    display_height: Pixels,
+) -> (NSRect, NSPoint) {
+    let left = bounds.origin.x.as_f32() as f64;
+    let top = (display_height - bounds.origin.y).as_f32() as f64;
+    let width = bounds.size.width.as_f32() as f64;
+    let height = bounds.size.height.as_f32() as f64;
+    let content_rect = NSRect::new(NSPoint::new(left, top - height), NSSize::new(width, height));
+    let top_left = NSPoint::new(screen_frame.origin.x + left, screen_frame.origin.y + top);
+    (content_rect, top_left)
+}
+
 unsafe impl Send for MacWindowState {}
 
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
@@ -976,26 +995,20 @@ impl MacWindow {
                 NSScreen::frame(screen)
             });
 
-            let window_rect = NSRect::new(
-                NSPoint::new(
-                    screen_frame.origin.x + bounds.origin.x.as_f32() as f64,
-                    screen_frame.origin.y
-                        + (display.bounds().size.height - bounds.origin.y).as_f32() as f64,
-                ),
-                NSSize::new(
-                    bounds.size.width.as_f32() as f64,
-                    bounds.size.height.as_f32() as f64,
-                ),
-            );
+            let (content_rect, top_left) =
+                window_placement(bounds, screen_frame, display.bounds().size.height);
 
             let native_window = native_window.initWithContentRect_styleMask_backing_defer_screen_(
-                window_rect,
+                content_rect,
                 style_mask,
                 NSBackingStoreBuffered,
                 NO,
                 target_screen,
             );
             assert!(!native_window.is_null());
+            // The frame's top-left point puts a titled window's title bar inside `bounds` too.
+            // Set it before anything shows the window, so it is shown in its place.
+            NSWindow::setFrameTopLeftPoint_(native_window, top_left);
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
@@ -1216,11 +1229,6 @@ impl MacWindow {
                 native_window.orderFront_(nil);
             }
 
-            // Set the initial position of the window to the specified origin.
-            // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
-            // the window position might be incorrect if the main screen (the screen that contains the window that has focus)
-            //  is different from the primary screen.
-            NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
             {
                 let mut window_state = window.0.lock();
                 window_state.move_traffic_light();
@@ -3612,5 +3620,65 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    fn screen(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+    }
+
+    fn window_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+    }
+
+    #[test]
+    fn should_place_the_content_rect_by_its_bottom_left_corner() {
+        // Arrange
+        let main = screen(0., 0., 1512., 982.);
+        let bounds = window_bounds(116., 91., 1280., 800.);
+
+        // Act
+        let (content, _) = window_placement(bounds, main, px(982.));
+
+        // Assert
+        assert_eq!((content.origin.x, content.origin.y), (116., 91.));
+    }
+
+    #[test]
+    fn should_place_the_content_rect_relative_to_its_screen() {
+        // Arrange
+        let second = screen(1512., -200., 1920., 1080.);
+        let bounds = window_bounds(100., 50., 800., 600.);
+
+        // Act
+        let (content, _) = window_placement(bounds, second, px(1080.));
+
+        // Assert
+        assert_eq!((content.origin.x, content.origin.y), (100., 430.));
+    }
+
+    #[test]
+    fn should_give_the_content_rect_the_bounds_size() {
+        // Arrange
+        let main = screen(0., 0., 1512., 982.);
+        let bounds = window_bounds(116., 91., 1280., 800.);
+
+        // Act
+        let (content, _) = window_placement(bounds, main, px(982.));
+
+        // Assert
+        assert_eq!((content.size.width, content.size.height), (1280., 800.));
+    }
+
+    #[test]
+    fn should_put_the_frames_top_left_point_at_the_bounds_origin_in_global_coordinates() {
+        // Arrange
+        let second = screen(1512., -200., 1920., 1080.);
+        let bounds = window_bounds(100., 50., 800., 600.);
+
+        // Act
+        let (_, top_left) = window_placement(bounds, second, px(1080.));
+
+        // Assert
+        assert_eq!((top_left.x, top_left.y), (1612., 830.));
     }
 }
