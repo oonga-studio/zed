@@ -268,7 +268,8 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            let now = Instant::now();
+            // The executor's clock, so a test that advances it moves the spring.
+            let now = cx.background_executor().now();
             let initial = self.initial.unwrap_or(self.target);
             let mut state = state.unwrap_or_else(|| SpringElementState {
                 spring: SpringState {
@@ -584,10 +585,12 @@ mod tests {
         rendered_values: Rc<RefCell<Vec<Pixels>>>,
     }
 
+    const TEST_SPRING: SpringConfig = SpringConfig::new(100.0, 2.0, 1.0);
+
     impl Render for SpringAnimationTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let rendered_values = self.rendered_values.clone();
-            let mut animation = SpringAnimation::new(SpringConfig::new(100.0, 2.0, 1.0))
+            let mut animation = SpringAnimation::new(TEST_SPRING)
                 .to(self.target)
                 .with_epsilon(0.01)
                 .playback(self.playback);
@@ -711,6 +714,42 @@ mod tests {
                 |element, value| element.left(value),
             )
             .child(div());
+    }
+
+    #[gpui::test]
+    fn test_spring_animation_steps_by_the_executor_clock(cx: &mut TestAppContext) {
+        let rendered_values = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.open_window(size(px(100.0), px(100.0)), {
+            let rendered_values = rendered_values.clone();
+            move |_, _| SpringAnimationTestView {
+                target: px(0.0),
+                initial: None,
+                playback: SpringPlayback::Running,
+                rendered_values,
+            }
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                view.target = px(100.0);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.executor().advance_clock(Duration::from_millis(50));
+        simulate_next_frame(&window, cx);
+
+        let rest = SpringState {
+            position: 0.0,
+            velocity: 0.0,
+        };
+        let expected = TEST_SPRING.step(rest, 100.0, 0.05).position;
+        let rendered = f32::from(*rendered_values.borrow().last().unwrap());
+        assert!(
+            (rendered - expected).abs() < 1e-3,
+            "rendered {rendered}, expected {expected}"
+        );
     }
 
     #[gpui::test]
