@@ -1,6 +1,6 @@
 use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
-    Window, point, seal::Sealed,
+    Window, point, px, seal::Sealed,
 };
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
@@ -801,6 +801,69 @@ impl PlatformInput {
             PlatformInput::Pinch(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
             PlatformInput::Touch(_) => None,
+        }
+    }
+
+    /// This input with its window positions, which the platform reports in screen points, moved
+    /// into the layout pixels of a window zoomed by `zoom` (see `Window::set_zoom`). A pixel
+    /// scroll shrinks with them; a line scroll, a pinch's delta and key input stay as they are.
+    pub(crate) fn unzoomed(self, zoom: f32) -> Self {
+        if zoom == 1.0 {
+            return self;
+        }
+        let layout = |p: Point<Pixels>| p.map(|v| px(v.as_f32() / zoom));
+        match self {
+            PlatformInput::MouseDown(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::MouseDown(e)
+            }
+            PlatformInput::MouseUp(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::MouseUp(e)
+            }
+            PlatformInput::MousePressure(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::MousePressure(e)
+            }
+            PlatformInput::MouseMove(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::MouseMove(e)
+            }
+            PlatformInput::MouseExited(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::MouseExited(e)
+            }
+            PlatformInput::ScrollWheel(mut e) => {
+                e.position = layout(e.position);
+                if let ScrollDelta::Pixels(delta) = e.delta {
+                    e.delta = ScrollDelta::Pixels(layout(delta));
+                }
+                PlatformInput::ScrollWheel(e)
+            }
+            PlatformInput::Pinch(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::Pinch(e)
+            }
+            PlatformInput::FileDrop(event) => PlatformInput::FileDrop(match event {
+                FileDropEvent::Entered { position, paths } => FileDropEvent::Entered {
+                    position: layout(position),
+                    paths,
+                },
+                FileDropEvent::Pending { position } => FileDropEvent::Pending {
+                    position: layout(position),
+                },
+                FileDropEvent::Submit { position } => FileDropEvent::Submit {
+                    position: layout(position),
+                },
+                other @ (FileDropEvent::Exited | FileDropEvent::Ended) => other,
+            }),
+            PlatformInput::Touch(mut e) => {
+                e.position = layout(e.position);
+                PlatformInput::Touch(e)
+            }
+            other @ (PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_)) => other,
         }
     }
 

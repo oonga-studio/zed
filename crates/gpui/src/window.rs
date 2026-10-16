@@ -1177,6 +1177,7 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    zoom: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1750,7 +1751,9 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.dispatch_event(event.unzoomed(window.zoom), cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -1869,6 +1872,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            zoom: 1.0,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2139,6 +2143,11 @@ impl Window {
     /// surface be moved out of others' exclusive zones, and -1 ignores reserved
     /// space and may extend under other surfaces. (Wayland layer-shell windows only)
     pub fn set_exclusive_zone(&self, zone: Pixels) {
+        let zone = if zone > px(0.) {
+            zone * self.zoom
+        } else {
+            zone
+        };
         self.platform_window.set_exclusive_zone(zone);
     }
 
@@ -2165,7 +2174,9 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        let region: Option<Vec<_>> =
+            region.map(|rects| rects.iter().map(|r| self.screen_bounds(*r)).collect());
+        self.platform_window.set_input_region(region.as_deref());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -2431,9 +2442,9 @@ impl Window {
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
         self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.viewport_size = self.layout_size(self.platform_window.content_size());
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
+        self.mouse_position = self.layout_point(self.platform_window.mouse_position());
 
         self.refresh();
 
@@ -2556,9 +2567,9 @@ impl Window {
         scene
     }
 
-    /// Set the content size of the window.
+    /// Set the content size of the window, in layout pixels.
     pub fn resize(&mut self, size: Size<Pixels>) {
-        self.platform_window.resize(size);
+        self.platform_window.resize(size.map(|v| v * self.zoom));
     }
 
     /// Returns whether or not the window is currently fullscreen
@@ -2624,7 +2635,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(position.map(|v| v * self.zoom))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2638,7 +2650,7 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.zoom);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -2713,11 +2725,10 @@ impl Window {
         self.platform_window.show_character_palette();
     }
 
-    /// The scale factor of the display associated with the window. For example, it could
-    /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
-    /// be rendered as two pixels on screen.
+    /// How many device pixels one layout pixel covers: the display's scale factor (2.0 on a
+    /// "retina" display) times the window's [zoom](Self::zoom).
     pub fn scale_factor(&self) -> f32 {
-        self.scale_factor
+        self.scale_factor * self.zoom
     }
 
     /// Overrides the display scale factor for tests.
@@ -2725,6 +2736,52 @@ impl Window {
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
+    }
+
+    /// How much the window's content is magnified, 1.0 being none: every size grows with it,
+    /// as when a browser zooms a page, and the layout gets less room to fill.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Magnify the window's content by `zoom` (1.0 is none). The viewport shrinks to the
+    /// content size divided by it, everything paints that much larger, and events and the
+    /// geometry handed to the platform are converted between screen points and layout pixels.
+    /// A value that is not a positive number is ignored.
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut App) {
+        if !zoom.is_finite() || zoom <= 0.0 || zoom == self.zoom {
+            return;
+        }
+        let screen_mouse = self.mouse_position.map(|v| v * self.zoom);
+        self.zoom = zoom;
+        self.viewport_size = self.layout_size(self.platform_window.content_size());
+        self.mouse_position = self.layout_point(screen_mouse);
+        if let Some(inset) = self.client_inset {
+            self.platform_window.set_client_inset(inset * zoom);
+        }
+        self.refresh();
+        // Deferred: the caller is often a view that also observes the bounds.
+        self.defer(cx, |window, cx| {
+            window
+                .bounds_observers
+                .clone()
+                .retain(&(), |callback| callback(window, cx));
+        });
+    }
+
+    /// A size in the platform's screen points, as layout pixels at the window's zoom.
+    fn layout_size(&self, size: Size<Pixels>) -> Size<Pixels> {
+        size.map(|v| px(v.as_f32() / self.zoom))
+    }
+
+    /// A point in the platform's screen points, as layout pixels at the window's zoom.
+    pub(crate) fn layout_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        point.map(|v| px(v.as_f32() / self.zoom))
+    }
+
+    /// Bounds in layout pixels, as the platform's screen points at the window's zoom.
+    pub(crate) fn screen_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        bounds.map(|v| v * self.zoom)
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -3282,7 +3339,7 @@ impl Window {
             // and frame are still in scope.
             let frame_info = crate::window::a11y::debug::FrameDebugInfo {
                 viewport_size: self.viewport_size,
-                scale_factor: self.scale_factor,
+                scale_factor: self.scale_factor(),
                 tab_stop_count: self.next_frame.tab_stops.tab_stop_count(),
             };
             // clear the builder state regardless
@@ -8093,5 +8150,458 @@ mod image_release_tests {
         });
         cx.update(|window, _cx| assert!(is_resident(window, &key)));
         drop(shared);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use std::cell::{Cell, RefCell};
+    use std::ops::Range;
+    use std::rc::Rc;
+
+    use crate::{
+        App, AppContext as _, Bounds, Context, InputEvent as _, InputHandler,
+        InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+        ParentElement as _, Pixels, PlatformInputHandler, Point, Render, ScrollDelta,
+        ScrollWheelEvent, Styled as _, TestAppContext, UTF16Selection, Window, bounds, div, point,
+        px, rgb, size,
+    };
+
+    /// A full-window view that records the positions and scroll distances it is handed.
+    #[derive(Default)]
+    struct Recorder {
+        downs: Rc<RefCell<Vec<Point<Pixels>>>>,
+        scrolls: Rc<RefCell<Vec<ScrollDelta>>>,
+    }
+
+    impl Render for Recorder {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let downs = self.downs.clone();
+            let scrolls = self.scrolls.clone();
+            div()
+                .id("recorder")
+                .size_full()
+                .on_mouse_down(MouseButton::Left, move |event, _, _| {
+                    downs.borrow_mut().push(event.position)
+                })
+                .on_scroll_wheel(move |event, _, _| scrolls.borrow_mut().push(event.delta))
+                .child(div().w(px(10.)).h(px(10.)).bg(rgb(0xff0000)))
+        }
+    }
+
+    /// An input handler whose text sits at fixed bounds, recording the point it is asked about.
+    struct FixedText {
+        bounds: Bounds<Pixels>,
+        asked_at: Rc<Cell<Option<Point<Pixels>>>>,
+    }
+
+    impl InputHandler for FixedText {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            Some(UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            })
+        }
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            Some(self.bounds)
+        }
+        fn character_index_for_point(
+            &mut self,
+            point: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            self.asked_at.set(Some(point));
+            Some(0)
+        }
+    }
+
+    fn pixel_distance(delta: &ScrollDelta) -> Option<Point<Pixels>> {
+        match delta {
+            ScrollDelta::Pixels(distance) => Some(*distance),
+            ScrollDelta::Lines(_) => None,
+        }
+    }
+
+    fn line_distance(delta: &ScrollDelta) -> Option<Point<f32>> {
+        match delta {
+            ScrollDelta::Lines(distance) => Some(*distance),
+            ScrollDelta::Pixels(_) => None,
+        }
+    }
+
+    fn mouse_down(position: Point<Pixels>) -> MouseDownEvent {
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        }
+    }
+
+    #[gpui::test]
+    fn should_start_a_window_at_no_zoom(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+
+        let zoom = window.update(cx, |_, window, _| window.zoom()).unwrap();
+
+        assert_eq!(zoom, 1.0);
+    }
+
+    #[gpui::test]
+    fn should_halve_the_viewport_at_200_percent(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        let before = window
+            .update(cx, |_, window, _| window.viewport_size())
+            .unwrap();
+
+        let after = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                window.viewport_size()
+            })
+            .unwrap();
+
+        assert_eq!(after, size(before.width * 0.5, before.height * 0.5));
+    }
+
+    #[gpui::test]
+    fn should_double_the_scale_factor_at_200_percent(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        let display = window
+            .update(cx, |_, window, _| window.scale_factor())
+            .unwrap();
+
+        let zoomed = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                window.scale_factor()
+            })
+            .unwrap();
+
+        assert_eq!(zoomed, display * 2.0);
+    }
+
+    #[gpui::test]
+    fn should_keep_the_zoom_across_a_resize(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+
+        cx.test_window(window.into())
+            .simulate_resize(size(px(800.), px(600.)));
+        let viewport = window
+            .update(cx, |_, window, _| window.viewport_size())
+            .unwrap();
+
+        assert_eq!(viewport, size(px(400.), px(300.)));
+    }
+
+    #[gpui::test]
+    fn should_ignore_a_zoom_that_is_not_a_positive_number(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+
+        let zoom = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(1.5, cx);
+                window.set_zoom(0.0, cx);
+                window.set_zoom(-2.0, cx);
+                window.set_zoom(f32::NAN, cx);
+                window.zoom()
+            })
+            .unwrap();
+
+        assert_eq!(zoom, 1.5);
+    }
+
+    #[gpui::test]
+    fn should_tell_bounds_observers_when_the_zoom_changes(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        let told = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, cx| {
+                let told = told.clone();
+                cx.observe_window_bounds(window, move |_, _, _| told.set(told.get() + 1))
+            })
+            .unwrap()
+            .detach();
+
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+
+        assert_eq!(told.get(), 1);
+    }
+
+    #[gpui::test]
+    fn should_map_a_click_from_screen_points_to_layout_pixels(cx: &mut TestAppContext) {
+        let downs = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let downs = downs.clone();
+            move |_, _| Recorder {
+                downs,
+                ..Default::default()
+            }
+        });
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.test_window(window.into())
+            .simulate_input(mouse_down(point(px(100.), px(60.))).to_platform_input());
+
+        assert_eq!(*downs.borrow(), vec![point(px(50.), px(30.))]);
+    }
+
+    #[gpui::test]
+    fn should_track_the_mouse_in_layout_pixels(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+
+        cx.test_window(window.into()).simulate_input(
+            MouseMoveEvent {
+                position: point(px(100.), px(60.)),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+        );
+        let position = window
+            .update(cx, |_, window, _| window.mouse_position())
+            .unwrap();
+
+        assert_eq!(position, point(px(50.), px(30.)));
+    }
+
+    #[gpui::test]
+    fn should_move_the_mouse_position_with_a_zoom_change(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        cx.test_window(window.into()).simulate_input(
+            MouseMoveEvent {
+                position: point(px(100.), px(60.)),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+        );
+
+        let position = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                window.mouse_position()
+            })
+            .unwrap();
+
+        assert_eq!(position, point(px(50.), px(30.)));
+    }
+
+    #[gpui::test]
+    fn should_scale_a_pixel_scroll_to_layout_pixels(cx: &mut TestAppContext) {
+        let scrolls = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let scrolls = scrolls.clone();
+            move |_, _| Recorder {
+                scrolls,
+                ..Default::default()
+            }
+        });
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.test_window(window.into()).simulate_input(
+            ScrollWheelEvent {
+                position: point(px(20.), px(20.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                ..Default::default()
+            }
+            .to_platform_input(),
+        );
+
+        let seen: Vec<_> = scrolls.borrow().iter().map(pixel_distance).collect();
+        assert_eq!(seen, vec![Some(point(px(0.), px(-20.)))]);
+    }
+
+    #[gpui::test]
+    fn should_keep_a_line_scroll_as_it_is(cx: &mut TestAppContext) {
+        let scrolls = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let scrolls = scrolls.clone();
+            move |_, _| Recorder {
+                scrolls,
+                ..Default::default()
+            }
+        });
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.test_window(window.into()).simulate_input(
+            ScrollWheelEvent {
+                position: point(px(20.), px(20.)),
+                delta: ScrollDelta::Lines(point(0., -3.)),
+                ..Default::default()
+            }
+            .to_platform_input(),
+        );
+
+        let seen: Vec<_> = scrolls.borrow().iter().map(line_distance).collect();
+        assert_eq!(seen, vec![Some(point(0., -3.))]);
+    }
+
+    #[gpui::test]
+    fn should_paint_at_the_zoomed_scale(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+
+        window
+            .update(cx, |_, window, cx| window.set_zoom(2.0, cx))
+            .unwrap();
+
+        let painted = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window
+                    .painted_quads()
+                    .iter()
+                    .map(|quad| quad.bounds.size.width.0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+
+        // The test display is 2× and the zoom 2×: a 10 px square covers 40 device pixels.
+        assert!(painted.contains(&40.), "painted widths: {painted:?}");
+    }
+
+    #[gpui::test]
+    fn should_report_text_bounds_to_the_platform_in_screen_points(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        let mut handler = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                PlatformInputHandler::new(
+                    window.to_async(cx),
+                    Box::new(FixedText {
+                        bounds: bounds(point(px(10.), px(20.)), size(px(4.), px(16.))),
+                        asked_at: Rc::default(),
+                    }),
+                )
+            })
+            .unwrap();
+
+        let reported = handler.bounds_for_range(0..0);
+
+        assert_eq!(
+            reported,
+            Some(bounds(point(px(20.), px(40.)), size(px(8.), px(32.))))
+        );
+    }
+
+    #[gpui::test]
+    fn should_report_the_ime_caret_in_screen_points(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+
+        let reported = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                let mut handler = PlatformInputHandler::new(
+                    window.to_async(cx),
+                    Box::new(FixedText {
+                        bounds: bounds(point(px(10.), px(20.)), size(px(4.), px(16.))),
+                        asked_at: Rc::default(),
+                    }),
+                );
+                handler.selected_bounds(window, cx)
+            })
+            .unwrap();
+
+        assert_eq!(
+            reported,
+            Some(bounds(point(px(20.), px(40.)), size(px(8.), px(32.))))
+        );
+    }
+
+    #[gpui::test]
+    fn should_ask_for_a_character_at_a_point_in_layout_pixels(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+        let asked_at = Rc::new(Cell::new(None));
+        let mut handler = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                PlatformInputHandler::new(
+                    window.to_async(cx),
+                    Box::new(FixedText {
+                        bounds: Bounds::default(),
+                        asked_at: asked_at.clone(),
+                    }),
+                )
+            })
+            .unwrap();
+
+        handler.character_index_for_point(point(px(100.), px(60.)));
+
+        assert_eq!(asked_at.get(), Some(point(px(50.), px(30.))));
+    }
+
+    #[gpui::test]
+    fn should_size_a_resize_request_in_layout_pixels(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Recorder::default());
+
+        let viewport = window
+            .update(cx, |_, window, cx| {
+                window.set_zoom(2.0, cx);
+                window.resize(size(px(300.), px(200.)));
+                window.bounds_changed(cx);
+                window.viewport_size()
+            })
+            .unwrap();
+
+        assert_eq!(viewport, size(px(300.), px(200.)));
     }
 }
