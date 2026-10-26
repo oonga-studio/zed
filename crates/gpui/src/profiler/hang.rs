@@ -433,7 +433,7 @@ mod tests {
     use std::time::Duration;
 
     use proptest::prelude::*;
-    use rand::prelude::*;
+    use rand::{Rng as _, rngs::StdRng};
     use scheduler::SpawnTime;
 
     use crate::{
