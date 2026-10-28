@@ -16,7 +16,7 @@ use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
@@ -39,6 +39,7 @@ pub(crate) struct TestPlatform {
     pub(crate) prompts: RefCell<TestPrompts>,
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
+    pub(crate) quit_requested: Cell<bool>,
     pub(crate) system_notifications: RefCell<TestSystemNotifications>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart:
@@ -156,6 +157,7 @@ impl TestPlatform {
             current_find_pasteboard_item: Mutex::new(None),
             weak: weak.clone(),
             opened_url: Default::default(),
+            quit_requested: Default::default(),
             system_notifications: Default::default(),
             text_system,
             headless_renderer_factory,
@@ -379,7 +381,9 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
-    fn quit(&self) {}
+    fn quit(&self) {
+        self.quit_requested.set(true);
+    }
 
     fn restart(&self, path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
         if let Some(tx) = self.expect_restart.take() {

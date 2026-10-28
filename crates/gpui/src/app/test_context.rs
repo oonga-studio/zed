@@ -372,6 +372,12 @@ impl TestAppContext {
         self.test_platform.opened_url.borrow().clone()
     }
 
+    /// Whether the app has asked to quit with `App::quit` during this test. The test platform
+    /// does not quit, so the test goes on after.
+    pub fn quit_requested(&self) -> bool {
+        self.test_platform.quit_requested.get()
+    }
+
     /// Returns the application identity configured during this test.
     pub fn app_identity(&self) -> Option<(SharedString, SharedString)> {
         self.test_platform.app_identity()
@@ -1333,5 +1339,17 @@ mod tests {
 
         let response = receiver.await.unwrap().unwrap();
         assert_eq!(response, None);
+    }
+
+    #[gpui::test]
+    fn test_quit_is_recorded(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.quit());
+
+        assert!(cx.quit_requested());
+    }
+
+    #[gpui::test]
+    fn test_no_quit_is_recorded_until_one_is_asked(cx: &mut TestAppContext) {
+        assert!(!cx.quit_requested());
     }
 }

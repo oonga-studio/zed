@@ -17,6 +17,7 @@ use futures::channel::oneshot;
 use parking_lot::Mutex;
 
 use std::{
+    cell::Cell,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -35,6 +36,7 @@ pub struct VisualTestPlatform {
     platform: Rc<dyn Platform>,
     clipboard: Mutex<Option<ClipboardItem>>,
     find_pasteboard: Mutex<Option<ClipboardItem>>,
+    quit_requested: Cell<bool>,
 }
 
 impl VisualTestPlatform {
@@ -55,12 +57,18 @@ impl VisualTestPlatform {
             platform,
             clipboard: Mutex::new(None),
             find_pasteboard: Mutex::new(None),
+            quit_requested: Cell::new(false),
         }
     }
 
     /// Returns a reference to the TestDispatcher for controlling task scheduling and time.
     pub fn dispatcher(&self) -> &TestDispatcher {
         &self.dispatcher
+    }
+
+    /// Whether the app has asked to quit. The platform does not quit, so a test can go on after.
+    pub fn quit_requested(&self) -> bool {
+        self.quit_requested.get()
     }
 }
 
@@ -81,7 +89,9 @@ impl Platform for VisualTestPlatform {
         panic!("VisualTestPlatform::run should not be called in tests")
     }
 
-    fn quit(&self) {}
+    fn quit(&self) {
+        self.quit_requested.set(true);
+    }
 
     fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {}
 

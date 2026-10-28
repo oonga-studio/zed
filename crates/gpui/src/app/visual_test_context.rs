@@ -27,7 +27,7 @@ pub struct VisualTestAppContext {
     pub foreground_executor: ForegroundExecutor,
     /// The test dispatcher for deterministic task scheduling
     dispatcher: TestDispatcher,
-    platform: Rc<dyn Platform>,
+    platform: Rc<VisualTestPlatform>,
     text_system: Arc<TextSystem>,
 }
 
@@ -328,6 +328,12 @@ impl VisualTestAppContext {
         })
         .ok();
         self.run_until_parked();
+    }
+
+    /// Whether the app has asked to quit with `App::quit`. The platform does not quit, so the
+    /// context goes on after.
+    pub fn quit_requested(&self) -> bool {
+        self.platform.quit_requested()
     }
 
     /// Simulates the window becoming the active window, or ceasing to be it: runs what the
