@@ -1720,18 +1720,7 @@ impl Window {
             move |active| {
                 handle
                     .update(&mut cx, |_, window, cx| {
-                        window.active.set(active);
-                        window.modifiers = window.platform_window.modifiers();
-                        window.capslock = window.platform_window.capslock();
-                        window
-                            .activation_observers
-                            .clone()
-                            .retain(&(), |callback| callback(window, cx));
-
-                        window.bounds_changed(cx);
-                        window.refresh();
-
-                        SystemWindowTabController::update_last_active(cx, window.handle.id);
+                        window.active_status_changed(active, cx)
                     })
                     .log_err();
             }
@@ -2585,11 +2574,34 @@ impl Window {
     }
 
     pub(crate) fn appearance_changed(&mut self, cx: &mut App) {
-        self.appearance = self.platform_window.appearance();
+        let appearance = self.platform_window.appearance();
+        self.set_appearance(appearance, cx);
+    }
+
+    /// Takes `appearance` as the window's and tells its appearance observers, as a change the
+    /// platform reports does.
+    pub(crate) fn set_appearance(&mut self, appearance: WindowAppearance, cx: &mut App) {
+        self.appearance = appearance;
 
         self.appearance_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    /// Takes the window as the active one, or not, and tells its activation observers, as the
+    /// platform's report that it became or stopped being the key window does.
+    pub(crate) fn active_status_changed(&mut self, active: bool, cx: &mut App) {
+        self.active.set(active);
+        self.modifiers = self.platform_window.modifiers();
+        self.capslock = self.platform_window.capslock();
+        self.activation_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+
+        self.bounds_changed(cx);
+        self.refresh();
+
+        SystemWindowTabController::update_last_active(cx, self.handle.id);
     }
 
     pub(crate) fn button_layout_changed(&mut self, cx: &mut App) {
@@ -7355,6 +7367,55 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(observed_appearance.get(), Some(WindowAppearance::Dark));
+    }
+
+    #[gpui::test]
+    fn test_set_appearance_tells_the_appearance_observers(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let observed = Rc::new(Cell::new(None));
+        window
+            .update(cx, {
+                let observed = observed.clone();
+                move |_, window, cx| {
+                    window
+                        .observe_window_appearance(move |window, _| {
+                            observed.set(Some(window.appearance()))
+                        })
+                        .detach();
+                    window.set_appearance(WindowAppearance::Dark, cx);
+                }
+            })
+            .unwrap();
+
+        assert_eq!(observed.get(), Some(WindowAppearance::Dark));
+    }
+
+    #[gpui::test]
+    fn test_active_status_change_tells_the_activation_observers(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let observed = Rc::new(Cell::new(None));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.active_status_changed(true, cx)
+        })
+        .unwrap();
+        window
+            .update(cx, {
+                let observed = observed.clone();
+                move |_, window, cx| {
+                    cx.observe_window_activation(window, move |_, window, _| {
+                        observed.set(Some(window.is_window_active()))
+                    })
+                    .detach();
+                }
+            })
+            .unwrap();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.active_status_changed(false, cx)
+        })
+        .unwrap();
+
+        assert_eq!(observed.get(), Some(false));
     }
 
     #[gpui::test]

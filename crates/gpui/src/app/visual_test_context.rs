@@ -3,7 +3,7 @@ use crate::{
     Bounds, ClipboardItem, Context, Entity, EntityId, ForegroundExecutor, Global, InputEvent,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Platform, Point, Render, Result, Size, Task, TestDispatcher, TextSystem, VisualTestPlatform,
-    Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
+    Window, WindowAppearance, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
 };
 use anyhow::anyhow;
 use image::RgbaImage;
@@ -328,6 +328,35 @@ impl VisualTestAppContext {
         })
         .ok();
         self.run_until_parked();
+    }
+
+    /// Simulates the window becoming the active window, or ceasing to be it: runs what the
+    /// platform's active-status callback runs, without making the window key, which would take
+    /// the user's keyboard from whatever they are using.
+    pub fn simulate_window_activation(
+        &mut self,
+        window: AnyWindowHandle,
+        active: bool,
+    ) -> Result<()> {
+        self.update_window(window, |_, window, cx| {
+            window.active_status_changed(active, cx);
+        })?;
+        self.run_until_parked();
+        Ok(())
+    }
+
+    /// Simulates the window's appearance changing to `appearance`: runs what the platform's
+    /// appearance callback runs, without changing the system's appearance.
+    pub fn simulate_window_appearance(
+        &mut self,
+        window: AnyWindowHandle,
+        appearance: WindowAppearance,
+    ) -> Result<()> {
+        self.update_window(window, |_, window, cx| {
+            window.set_appearance(appearance, cx);
+        })?;
+        self.run_until_parked();
+        Ok(())
     }
 
     /// Dispatches an action to the given window.
